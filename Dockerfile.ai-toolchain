@@ -1,0 +1,16 @@
+FROM vllm/vllm-openai:latest
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PROJECT_DIR=/workspace
+
+WORKDIR /workspace
+
+# 先复制安装脚本
+COPY scripts/setup_ai_toolchain.sh /usr/local/bin/setup_ai_toolchain.sh
+RUN chmod +x /usr/local/bin/setup_ai_toolchain.sh
+
+# 构建阶段直接预装三大 CLI + 插件生态
+RUN /usr/local/bin/setup_ai_toolchain.sh install
+
+# 默认进入 bash，方便你直接在容器内开发
+ENTRYPOINT ["bash"]
