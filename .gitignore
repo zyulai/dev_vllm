@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# Tool outputs
+results/
+plots/
+
+# AI tool runtime/local state
+.omx/
+.opencode/
+.claude/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
