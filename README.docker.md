@@ -2,6 +2,8 @@
 
 这个文档说明如何使用本项目中的 `Dockerfile.ai-toolchain` 和脚本，快速拉起一个可开发的容器，并持续更新 CLI 与插件。
 
+> 如果你不想用容器，而是想直接在 Ubuntu / Debian 宿主机上配置相同的一套 shell + AI 工具链，请先看根目录 [`README.md`](README.md) 里的 `tools/bootstrap-ubuntu.sh` 用法。
+
 ---
 
 ## 1. 文件说明
@@ -20,6 +22,10 @@
 - `scripts/update_ai_plugins_daily.sh`
   - 宿主机执行脚本
   - 自动进入目标容器执行每日更新流程
+
+- `tools/bootstrap-ubuntu.sh`
+  - Ubuntu / Debian 宿主机一键初始化脚本
+  - 安装 zsh、Claude Code、Codex、OpenCode、Hermes 及相关插件
 
 ---
 
