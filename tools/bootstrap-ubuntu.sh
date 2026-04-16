@@ -365,7 +365,7 @@ ensure_nodejs() {
     return
   fi
 
-  log "Installing Node.js 22.x"
+  log "Installing Node.js 25.x"
   run_as_root mkdir -p /etc/apt/keyrings
 
   if [[ ! -f /etc/apt/keyrings/nodesource.gpg ]]; then
@@ -374,8 +374,8 @@ ensure_nodejs() {
   fi
 
   if [[ ! -f /etc/apt/sources.list.d/nodesource.list ]] \
-    || ! grep -Fq 'node_22.x' /etc/apt/sources.list.d/nodesource.list 2>/dev/null; then
-    printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main\n' \
+    || ! grep -Fq 'node_25.x' /etc/apt/sources.list.d/nodesource.list 2>/dev/null; then
+    printf 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_25.x nodistro main\n' \
       | run_as_root tee /etc/apt/sources.list.d/nodesource.list >/dev/null
   fi
 
