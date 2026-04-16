@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="$HOME/.claude/cc-switch.json"
+SETTINGS_FILE="$HOME/.claude/settings.json"
+
+usage() {
+  cat <<EOF
+Usage:
+  cc-switch
+  cc-switch init
+  cc-switch -h|--help
+
+Commands:
+  cc-switch       Select a configured Claude endpoint interactively
+  cc-switch init  Create ~/.claude/cc-switch.json if it does not exist
+EOF
+}
+
+die() {
+  printf 'cc-switch: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+config_helper() {
+  local command="$1"
+  shift
+
+  python3 - "$command" "$CONFIG_FILE" "$@" <<'PY'
+import json
+import os
+import sys
+
+command = sys.argv[1]
+path = os.path.expanduser(sys.argv[2])
+args = sys.argv[3:]
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_targets() -> list[dict[str, str]]:
+    if not os.path.exists(path):
+        fail(f"config file not found: {path}. Run `cc-switch init` first.")
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        fail(
+            f"config file is not valid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}"
+        )
+    except OSError as exc:
+        fail(f"failed to read config file: {exc}")
+
+    if not isinstance(data, dict):
+        fail("config file must contain a JSON object")
+
+    targets = data.get("targets")
+    if not isinstance(targets, list) or not targets:
+        fail("config file must contain a non-empty `targets` array")
+
+    cleaned: list[dict[str, str]] = []
+    for index, item in enumerate(targets, start=1):
+        if not isinstance(item, dict):
+            fail(f"target {index} must be a JSON object")
+
+        cleaned_item: dict[str, str] = {}
+        for field in ("name", "base_url", "auth_token"):
+            value = item.get(field)
+            if not isinstance(value, str) or not value.strip():
+                fail(f"target {index} field `{field}` must be a non-empty string")
+            if any(char in value for char in "\x00\r\n\t"):
+                fail(f"target {index} field `{field}` must not contain tabs or newlines")
+            cleaned_item[field] = value.strip()
+
+        cleaned.append(cleaned_item)
+
+    return cleaned
+
+
+if command == "init":
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        print(f"Config already exists: {path}")
+        raise SystemExit(0)
+
+    sample = {
+        "_comment": [
+            "请把下面示例改成你的真实代理配置。",
+            "每个 target 都需要填写 name、base_url、auth_token。",
+            "auth_token 留空表示这里还是模板，占位内容在使用前必须改成真实值。",
+            "你可以添加多个 target，运行 cc-switch 时会显示为可选项。"
+        ],
+        "targets": [
+            {
+                "name": "proxy-a",
+                "base_url": "https://example-a.internal",
+                "auth_token": ""
+            },
+            {
+                "name": "proxy-b",
+                "base_url": "https://example-b.internal",
+                "auth_token": ""
+            }
+        ]
+    }
+
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        print(f"Config already exists: {path}")
+        raise SystemExit(0)
+    except OSError as exc:
+        fail(f"failed to create config file: {exc}")
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(sample, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except OSError as exc:
+        fail(f"failed to write config file: {exc}")
+
+    print(f"Created sample config: {path}")
+    raise SystemExit(0)
+
+if command == "list":
+    for target in load_targets():
+        print(f"{target['name']}\t{target['base_url']}")
+    raise SystemExit(0)
+
+if command == "get":
+    if len(args) != 1:
+        fail("internal error: target index is required")
+    try:
+        selection = int(args[0])
+    except ValueError:
+        fail(f"invalid selection: {args[0]}")
+
+    targets = load_targets()
+    if selection < 1 or selection > len(targets):
+        fail(f"invalid selection: {selection}")
+
+    chosen = targets[selection - 1]
+    sys.stdout.buffer.write(chosen["base_url"].encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+    sys.stdout.buffer.write(chosen["auth_token"].encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+    raise SystemExit(0)
+
+fail(f"internal error: unknown config helper command: {command}")
+PY
+}
+
+settings_helper() {
+  local command="$1"
+  shift
+
+  python3 /dev/fd/3 "$command" "$SETTINGS_FILE" "$@" 3<<'PY'
+import json
+import os
+import stat
+import sys
+import tempfile
+
+command = sys.argv[1]
+path = os.path.expanduser(sys.argv[2])
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_settings() -> tuple[dict, int]:
+    if not os.path.exists(path):
+        return {}, 0o600
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except json.JSONDecodeError as exc:
+        fail(
+            f"settings file is not valid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}"
+        )
+    except OSError as exc:
+        fail(f"failed to read settings file: {exc}")
+
+    if not isinstance(data, dict):
+        fail("settings file must contain a JSON object")
+
+    env = data.get("env")
+    if env is not None and not isinstance(env, dict):
+        fail("settings file field `env` must be a JSON object")
+
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode) or 0o600
+    except OSError:
+        mode = 0o600
+
+    return data, mode
+
+
+if command == "validate":
+    load_settings()
+    raise SystemExit(0)
+
+if command == "current":
+    data, _ = load_settings()
+    env = data.get("env") or {}
+
+    base_url = env.get("ANTHROPIC_BASE_URL", "")
+    auth_token = env.get("ANTHROPIC_AUTH_TOKEN", "")
+
+    if not isinstance(base_url, str):
+        base_url = ""
+    if not isinstance(auth_token, str):
+        auth_token = ""
+
+    sys.stdout.buffer.write(base_url.encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+    sys.stdout.buffer.write(auth_token.encode("utf-8"))
+    sys.stdout.buffer.write(b"\0")
+    raise SystemExit(0)
+
+if command == "update":
+    payload = sys.stdin.buffer.read().split(b"\0")
+    if len(payload) < 3:
+        fail("internal error: settings payload is incomplete")
+
+    base_url = payload[0].decode("utf-8")
+    auth_token = payload[1].decode("utf-8")
+    data, mode = load_settings()
+
+    env = data.get("env")
+    if env is None:
+        env = {}
+    data["env"] = env
+
+    env["ANTHROPIC_BASE_URL"] = base_url
+    env["ANTHROPIC_AUTH_TOKEN"] = auth_token
+
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".settings.json.", dir=directory, text=True)
+    except OSError as exc:
+        fail(f"failed to create temporary settings file: {exc}")
+
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    except OSError as exc:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        fail(f"failed to write settings file: {exc}")
+
+    print(f"Switched Claude endpoint to {base_url}")
+    raise SystemExit(0)
+
+fail(f"internal error: unknown settings helper command: {command}")
+PY
+}
+
+pick_target_index() {
+  local current_base_url="$1"
+  shift
+  local targets=("$@")
+  local current_index=""
+  local i=1
+
+  printf 'Available Claude targets:\n' >&2
+  for entry in "${targets[@]}"; do
+    local name base_url marker
+    IFS=$'\t' read -r name base_url <<< "$entry"
+    marker=' '
+    if [[ -z "$current_index" && -n "$current_base_url" && "$base_url" == "$current_base_url" ]]; then
+      marker='*'
+      current_index="$i"
+    fi
+    printf ' %2d) [%s] %s (%s)\n' "$i" "$marker" "$name" "$base_url" >&2
+    i=$((i + 1))
+  done
+
+  if [[ -n "$current_index" ]]; then
+    printf 'Select target number [%s]: ' "$current_index" >&2
+  else
+    printf 'Select target number: ' >&2
+  fi
+
+  local selection
+  read -r selection
+
+  if [[ -z "$selection" ]]; then
+    [[ -n "$current_index" ]] || die 'selection is required'
+    selection="$current_index"
+  fi
+
+  [[ "$selection" =~ ^[0-9]+$ ]] || die "invalid selection: $selection"
+  (( selection >= 1 && selection <= ${#targets[@]} )) || die "invalid selection: $selection"
+
+  printf '%s\n' "$selection"
+}
+
+init_config() {
+  local output
+  output="$(config_helper init)"
+  printf '%s\n' "$output"
+  if [[ "$output" == Created\ sample\ config:* ]]; then
+    printf 'Edit %s and fill in your real base_url/auth_token values, then run cc-switch.\n' "$CONFIG_FILE"
+  fi
+}
+
+main() {
+  need_cmd python3
+
+  case "${1:-}" in
+    init)
+      init_config
+      return
+      ;;
+    -h|--help)
+      usage
+      return
+      ;;
+    "")
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+
+  settings_helper validate
+
+  local target_lines=()
+  mapfile -t target_lines < <(config_helper list)
+
+  local current_fields=()
+  mapfile -d '' -t current_fields < <(settings_helper current)
+  local current_base_url="${current_fields[0]-}"
+  local current_auth_token="${current_fields[1]-}"
+
+  local selected_index
+  selected_index="$(pick_target_index "$current_base_url" "${target_lines[@]}")"
+
+  local selected_fields=()
+  mapfile -d '' -t selected_fields < <(config_helper get "$selected_index")
+  local selected_base_url="${selected_fields[0]-}"
+  local selected_auth_token="${selected_fields[1]-}"
+
+  if [[ "$selected_base_url" == "$current_base_url" && "$selected_auth_token" == "$current_auth_token" ]]; then
+    printf 'Claude target unchanged: %s\n' "$selected_base_url"
+    return
+  fi
+
+  printf '%s\0%s\0' "$selected_base_url" "$selected_auth_token" | settings_helper update
+}
+
+main "${1:-}"
