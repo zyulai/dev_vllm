@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SELF_PATH="$SELF_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+CONFIG_FILE="${CODEX_CONFIG_FILE:-$HOME/.codex/config.toml}"
+AUTH_FILE="${CODEX_AUTH_FILE:-$HOME/.codex/auth.json}"
+INSTALL_DIR="$HOME/.codex/bin"
+INSTALL_PATH="$INSTALL_DIR/codex-model"
+
+die() {
+  printf 'codex-model: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  codex-model
+  codex-model init
+  codex-model -h|--help
+
+Commands:
+  codex-model       Fetch available models and choose one interactively
+  codex-model init  Install codex-model to ~/.codex/bin and add that dir to ~/.zshrc or ~/.bashrc
+EOF
+}
+
+extract_quoted_value() {
+  sed -n 's/^[^"]*"\([^"]*\)".*$/\1/p'
+}
+
+get_root_setting() {
+  local key="$1"
+  awk -v key="$key" '
+    /^\[/ { exit }
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" | extract_quoted_value
+}
+
+get_provider_base_url() {
+  local provider="$1"
+  awk -v section="[model_providers.${provider}]" '
+    $0 == section { in_section=1; next }
+    in_section && /^\[/ { exit }
+    in_section && /^[[:space:]]*base_url[[:space:]]*=/ {
+      print
+      exit
+    }
+  ' "$CONFIG_FILE" | extract_quoted_value
+}
+
+get_api_key() {
+  grep -m1 '"OPENAI_API_KEY"[[:space:]]*:' "$AUTH_FILE" \
+    | sed -n 's/.*"OPENAI_API_KEY"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+fetch_models() {
+  local base_url="$1"
+  local api_key="$2"
+  curl -fsS \
+    -H "Authorization: Bearer $api_key" \
+    "${base_url%/}/models"
+}
+
+parse_model_ids() {
+  grep -o '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/^"id"[[:space:]]*:[[:space:]]*"//; s/"$//' \
+    | awk 'NF && !seen[$0]++'
+}
+
+print_response_preview() {
+  local response="$1"
+  printf '%s\n' "$response" | sed -n '1,10p' >&2
+}
+
+pick_model() {
+  local current_model="$1"
+  shift
+  local models=("$@")
+  local current_index=""
+  local i=1
+
+  printf 'Available models:\n' >&2
+  for model in "${models[@]}"; do
+    local marker=' '
+    if [[ "$model" == "$current_model" ]]; then
+      marker='*'
+      current_index="$i"
+    fi
+    printf ' %2d) [%s] %s\n' "$i" "$marker" "$model" >&2
+    i=$((i + 1))
+  done
+
+  if [[ -n "$current_index" ]]; then
+    printf 'Select model number [%s]: ' "$current_index" >&2
+  else
+    printf 'Select model number: ' >&2
+  fi
+
+  local selection
+  read -r selection
+
+  if [[ -z "$selection" ]]; then
+    [[ -n "$current_index" ]] || die 'selection is required'
+    selection="$current_index"
+  fi
+
+  if [[ "$selection" =~ ^[0-9]+$ ]]; then
+    local index=$((selection - 1))
+    (( index >= 0 && index < ${#models[@]} )) || die "invalid selection: $selection"
+    printf '%s\n' "${models[$index]}"
+    return
+  fi
+
+  for model in "${models[@]}"; do
+    if [[ "$model" == "$selection" ]]; then
+      printf '%s\n' "$model"
+      return
+    fi
+  done
+
+  die "invalid selection: $selection"
+}
+
+update_root_model() {
+  local new_model="$1"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  if ! awk -v new_model="$new_model" '
+    BEGIN { in_root=1; replaced=0 }
+    /^\[/ { in_root=0 }
+    in_root && !replaced && /^[[:space:]]*model[[:space:]]*=/ {
+      print "model = \"" new_model "\""
+      replaced=1
+      next
+    }
+    { print }
+    END {
+      if (!replaced) {
+        exit 2
+      }
+    }
+  ' "$CONFIG_FILE" > "$tmp_file"; then
+    rm -f "$tmp_file"
+    die "failed to update top-level model in $CONFIG_FILE"
+  fi
+
+  mv "$tmp_file" "$CONFIG_FILE"
+}
+
+choose_rc_file() {
+  local shell_name
+  shell_name="$(basename "${SHELL:-}")"
+
+  if [[ -n "${ZSH_VERSION:-}" || "$shell_name" == "zsh" ]]; then
+    printf '%s\n' "$HOME/.zshrc"
+    return
+  fi
+
+  if [[ -n "${BASH_VERSION:-}" || "$shell_name" == "bash" ]]; then
+    printf '%s\n' "$HOME/.bashrc"
+    return
+  fi
+
+  if [[ -f "$HOME/.zshrc" ]]; then
+    printf '%s\n' "$HOME/.zshrc"
+    return
+  fi
+
+  printf '%s\n' "$HOME/.bashrc"
+}
+
+init_shell() {
+  local rc_file
+  local install_message
+  rc_file="$(choose_rc_file)"
+  mkdir -p "$INSTALL_DIR"
+  if [[ "$SELF_PATH" == "$INSTALL_PATH" ]]; then
+    install_message="codex-model already running from $INSTALL_PATH"
+  else
+    cp "$SELF_PATH" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    install_message="Installed $INSTALL_PATH"
+  fi
+  mkdir -p "$(dirname "$rc_file")"
+  touch "$rc_file"
+
+  if grep -Fq '# codex-model init' "$rc_file"; then
+    printf '%s and rc already initialized in %s\n' "$install_message" "$rc_file"
+    return
+  fi
+
+  cat >> "$rc_file" <<EOF
+
+# codex-model init
+if [ -d "\$HOME/.codex/bin" ]; then
+  case ":\$PATH:" in
+    *:"\$HOME/.codex/bin":*) ;;
+    *) export PATH="\$HOME/.codex/bin:\$PATH" ;;
+  esac
+fi
+EOF
+
+  printf '%s and added %s to PATH in %s\n' "$install_message" '$HOME/.codex/bin' "$rc_file"
+}
+
+main() {
+  need_cmd curl
+  need_cmd grep
+  need_cmd sed
+  need_cmd awk
+
+  case "${1:-}" in
+    init)
+      init_shell
+      return
+      ;;
+    -h|--help)
+      usage
+      return
+      ;;
+    "")
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+
+  [[ -f "$CONFIG_FILE" ]] || die "config file not found: $CONFIG_FILE"
+  [[ -f "$AUTH_FILE" ]] || die "auth file not found: $AUTH_FILE"
+
+  local current_model provider base_url api_key response selected_model
+  current_model="$(get_root_setting model)"
+  provider="$(get_root_setting model_provider)"
+
+  [[ -n "$current_model" ]] || die "failed to read top-level model from $CONFIG_FILE"
+  [[ -n "$provider" ]] || die "failed to read top-level model_provider from $CONFIG_FILE"
+
+  base_url="$(get_provider_base_url "$provider")"
+  [[ -n "$base_url" ]] || die "failed to read base_url for provider $provider from $CONFIG_FILE"
+
+  api_key="$(get_api_key)"
+  [[ -n "$api_key" ]] || die "failed to read OPENAI_API_KEY from $AUTH_FILE"
+
+  response="$(fetch_models "$base_url" "$api_key")" || die "failed to fetch models from ${base_url%/}/models"
+
+  local models=()
+  mapfile -t models < <(printf '%s\n' "$response" | parse_model_ids)
+
+  if [[ "${#models[@]}" -eq 0 ]]; then
+    printf 'codex-model: no model ids were found in the /models response\n' >&2
+    print_response_preview "$response"
+    exit 1
+  fi
+
+  selected_model="$(pick_model "$current_model" "${models[@]}")"
+
+  if [[ "$selected_model" == "$current_model" ]]; then
+    printf 'Model unchanged: %s\n' "$current_model"
+    return
+  fi
+
+  update_root_model "$selected_model"
+  printf 'Updated model: %s -> %s\n' "$current_model" "$selected_model"
+}
+
+main "${1:-}"
